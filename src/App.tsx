@@ -10,6 +10,7 @@ interface NetworkPacket {
   dropProgress: number
   lane: number
   speedVar: number
+  type: 'voice' | 'video' | 'data'
 }
 
 interface NetworkProfile {
@@ -96,6 +97,22 @@ function App() {
         const willBeLost = Math.random() < totalLossProb
         const dropProgress = willBeLost ? 30 + Math.random() * 40 : 200 // Drop anywhere 30-70
 
+        // QoS Logic: Assign a random traffic type
+        const rand = Math.random()
+        const type: 'voice' | 'video' | 'data' = rand < 0.2 ? 'voice' : rand < 0.6 ? 'video' : 'data'
+
+        // Calculate loss exactly once at creation
+        const baseLoss = statsRef.current.lossRate / 100
+        const congestionLoss = (statsRef.current.congestion / 100) * 0.2
+        let totalLossProb = Math.min(1.0, baseLoss + congestionLoss)
+
+        // Apply Priority Resistance (QoS)
+        if (type === 'voice') totalLossProb *= 0.1 // 90% resistance
+        else if (type === 'video') totalLossProb *= 0.5 // 50% resistance
+
+        const willBeLost = Math.random() < totalLossProb
+        const dropProgress = willBeLost ? 30 + Math.random() * 40 : 200 // Drop anywhere 30-70
+
         const newPacket: NetworkPacket = {
           id: Date.now() + Math.random(),
           progress: 0,
@@ -104,7 +121,8 @@ function App() {
           lossTtl: 0,
           dropProgress,
           lane: 20 + Math.random() * 60, // vertical percentage from 20% to 80%
-          speedVar: 0.85 + Math.random() * 0.3 // 0.85x to 1.15x speed jitter
+          speedVar: 0.85 + Math.random() * 0.3, // 0.85x to 1.15x speed jitter
+          type
         }
         
         sentThisTick += 1
@@ -286,7 +304,7 @@ function App() {
                   {packets.map((packet) => (
                     <div
                       key={packet.id}
-                      className={`packet-capsule ${packet.status === 'lost' ? 'lost' : 'active'}`}
+                      className={`packet-capsule ${packet.status === 'lost' ? 'lost' : 'active'} type-${packet.type}`}
                       style={{ 
                         left: `${packet.progress}%`,
                         top: `${packet.lane}%`,
@@ -297,6 +315,12 @@ function App() {
                     </div>
                   ))}
                 </div>
+              </div>
+
+              <div className="traffic-legend">
+                <div className="legend-item"><span className="dot voice"></span> Voice (High Prio)</div>
+                <div className="legend-item"><span className="dot video"></span> Video (Med Prio)</div>
+                <div className="legend-item"><span className="dot data"></span> Bulk Data (Low Prio)</div>
               </div>
             </div>
 
