@@ -34,13 +34,11 @@ const ServerIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
 )
 
-const MonitorIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-)
 
 const PacketIcon = () => (
   <div className="packet-square-box"></div>
 )
+
 
 const LostIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
@@ -48,7 +46,7 @@ const LostIcon = () => (
 
 function App() {
   const [packets, setPackets] = useState<NetworkPacket[]>([])
-  const [stats, setStats] = useState({ throughput: 0, delay: 5, lossRate: 10, congestion: 30, sent: 0 })
+  const [stats, setStats] = useState({ throughput: 0, delay: 5, lossRate: 10, congestion: 30, sent: 0, delivered: 0 })
   const [isRunning, setIsRunning] = useState(true)
   const [speed, setSpeed] = useState(1)
   const [packetTarget, setPacketTarget] = useState(20)
@@ -56,9 +54,14 @@ function App() {
   const [lostTotal, setLostTotal] = useState(0)
   const [cwnd, setCwnd] = useState(1)
   const [ssthresh, setSsthresh] = useState(64)
-  const [history, setHistory] = useState<{cwnd: number, throughput: number}[]>([])
   const [activeProfile, setActiveProfile] = useState<string | null>(null)
   const [selectedType, setSelectedType] = useState<'all' | 'voice' | 'video' | 'data'>('all')
+  
+  // Chaos Engine State
+  const [activeTab, setActiveTab] = useState<'simulation' | 'chaos'>('simulation')
+  const [isChaosEnabled, setIsChaosEnabled] = useState(false)
+  const [activeEvent, setActiveEvent] = useState<{ type: string, label: string, color: string } | null>(null)
+  const [eventLog, setEventLog] = useState<{ time: string, msg: string }[]>([])
 
   // Use refs for the simulation loop to prevent erratic interval resets
   const statsRef = useRef(stats)
@@ -83,6 +86,14 @@ function App() {
       let newlyLost = 0
       let sentThisTick = 0
       let newlyDelivered = 0
+      
+      const currentStats = statsRef.current
+      const currentEvent = activeEventRef.current
+
+      // Chaos Overrides
+      const effectiveLoss = currentEvent?.type === 'fiber-cut' ? 100 : currentStats.lossRate
+      const effectiveCongestion = currentEvent?.type === 'ddos' ? 95 : currentStats.congestion
+      const jitterMultiplier = currentEvent?.type === 'solar-flare' ? 5 : 1
 
       let currentPackets = packetsRef.current
 
@@ -140,17 +151,16 @@ function App() {
           return
         }
 
-        // Jitter Physics: Apply individual speed variance to progress
-        const jitteredSpeed = speed * p.speedVar
-        const newProgress = p.progress + (0.8 + statsRef.current.congestion / 100) * jitteredSpeed
+        const jSpeed = speed * p.speedVar * jitterMultiplier
+        const newProgress = p.progress + (0.8 + effectiveCongestion / 100) * jSpeed
 
         // Check if packet has passed its assigned drop progress within the loss zone
         const isLost = p.progress < p.dropProgress && newProgress >= p.dropProgress
 
-        if (isLost) {
+        if (isLost || Math.random() < effectiveLoss / 1000) { // fiber-cut impact
           newlyLost += 1
           experiencedDrop = true
-          updated.push({ ...p, progress: p.dropProgress, status: 'lost', lossTtl: 18 })
+          updated.push({ ...p, progress: Math.min(newProgress, p.dropProgress), status: 'lost', lossTtl: 18 })
           return
         }
 
@@ -168,6 +178,8 @@ function App() {
 
         updated.push({ ...p, progress: newProgress })
       })
+
+      setPackets(updated)
 
       // Apply TCP Window state changes
       if (experiencedDrop) {
@@ -187,6 +199,9 @@ function App() {
       }
       if (newlyLost > 0) {
         setLostTotal((prev) => prev + newlyLost)
+      }
+      if (newlyDelivered > 0) {
+        setStats(prev => ({ ...prev, delivered: prev.delivered + newlyDelivered }))
       }
 
     }, 100 / speed)
@@ -212,28 +227,37 @@ function App() {
     })
   }, [isTransferring, activePackets, queuedPackets, speed, stats.congestion])
 
-  // Oscilloscope Graph telemetry loop
-  useEffect(() => {
-    if (!isRunning) return
-    const graphInterval = setInterval(() => {
-      setHistory(prev => {
-        const next = [...prev, { cwnd: Math.floor(cwndRef.current), throughput: statsRef.current.throughput }]
-        if (next.length > 30) return next.slice(next.length - 30)
-        return next
-      })
-    }, 500)
-    return () => clearInterval(graphInterval)
-  }, [isRunning])
-
-  // Calculated metrics strictly per FORMULAS.md
-  // Using deliveredTotal is safer for the UI visually, but let's adhere strictly to formula if required.
-  // Formula: max(0, sent - lostTotal - activePackets). This gives perfect math.
-  const deliveredPackets = Math.max(0, stats.sent - lostTotal - activePackets)
-  const lostPackets = packets.filter((p) => p.status === 'lost').length
-  const observedLossRate = stats.sent > 0 ? (lostTotal / stats.sent) * 100 : 0
-
   const congestionState =
     stats.congestion < 30 ? 'Low congestion' : stats.congestion < 65 ? 'Moderate congestion' : 'High congestion'
+
+  const activeEventRef = useRef(activeEvent)
+  useEffect(() => { activeEventRef.current = activeEvent }, [activeEvent])
+
+  const triggerChaos = (type: string) => {
+    const events: Record<string, any> = {
+      'ddos': { type: 'ddos', label: 'DDoS Attack Active', color: '#ff4444' },
+      'solar-flare': { type: 'solar-flare', label: 'Solar Flare Jitter', color: '#ffaa00' },
+      'fiber-cut': { type: 'fiber-cut', label: 'Fiber Cut / Blackout', color: '#ffffff' }
+    }
+    const event = events[type]
+    setActiveEvent(event)
+    setEventLog(prev => [{ time: new Date().toLocaleTimeString(), msg: `EMERGENCY: ${event.label}` }, ...prev].slice(0, 10))
+    
+    // Auto-clear after 6 seconds
+    setTimeout(() => setActiveEvent(null), 6000)
+  }
+
+  // Chaos Engine Loop
+  useEffect(() => {
+    if (!isChaosEnabled) return
+    const id = setInterval(() => {
+      if (Math.random() < 0.3 && !activeEvent) {
+        const types = ['ddos', 'solar-flare', 'fiber-cut']
+        triggerChaos(types[Math.floor(Math.random() * types.length)])
+      }
+    }, 5000)
+    return () => clearInterval(id)
+  }, [isChaosEnabled, activeEvent])
 
   const queuePacketBatch = () => {
     if (packetTarget <= 0) return
@@ -243,18 +267,45 @@ function App() {
   const applyProfile = (profile: NetworkProfile) => {
     setActiveProfile(profile.id)
     setStats(prev => ({ ...prev, lossRate: profile.lossRate, congestion: profile.congestion }))
+    setStats((prev) => ({
+      ...prev,
+      lossRate: profile.lossRate,
+      congestion: profile.congestion,
+    }))
     setSpeed(profile.speed)
   }
+
 
   return (
     <div className="app glass-bg">
       <div className="ambient-glow bg-blur-1"></div>
       <div className="ambient-glow bg-blur-2"></div>
-      <div className="ambient-glow bg-blur-3"></div>
+
+      {activeEvent && (
+        <div className="chaos-banner" style={{ backgroundColor: activeEvent.color }}>
+          <span className="warning-icon">⚠️</span> {activeEvent.label.toUpperCase()} IN PROGRESS
+        </div>
+      )}
 
       <header className="header glass-panel">
         <div className="header-content">
-          <h1 className="neon-text">Congestion Control Visualizer</h1>
+          <div className="header-main">
+            <h1 className="neon-text">Congestion Control Visualizer</h1>
+            <div className="tabs">
+              <button
+                className={`tab-btn ${activeTab === 'simulation' ? 'active' : ''}`}
+                onClick={() => setActiveTab('simulation')}
+              >
+                Simulation
+              </button>
+              <button
+                className={`tab-btn ${activeTab === 'chaos' ? 'active' : ''}`}
+                onClick={() => setActiveTab('chaos')}
+              >
+                Chaos Lab
+              </button>
+            </div>
+          </div>
           <div className="profile-selector">
             {NETWORK_PROFILES.map((profile) => (
               <button
@@ -269,223 +320,312 @@ function App() {
           </div>
         </div>
       </header>
-
       <main className="main-container">
-        {/* Top: Network Visualization */}
-        <section className="network-visualization glass-panel neon-border">
-          <div className="network-diagram">
-            <div className="node source-node">
-              <div 
-                className="cwnd-ring" 
-                style={{ 
-                  transform: `scale(${1 + Math.min(4, cwnd / 20)})`,
-                  opacity: Math.max(0.1, 1 - cwnd / 100)
-                }} 
-              />
-              <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
-              <div className="node-label">Source Node</div>
-              <div className="node-stats">CWND: {Math.floor(cwnd)}</div>
-            </div>
-
-            <div className="channel-container">
-              <div className="channel-info">
-                <span className="label">Network Medium</span>
-                <span className={`congestion-tag ${stats.congestion > 65 ? 'high' : stats.congestion > 30 ? 'med' : 'low'}`}>
-                  Congestion: {Math.round(stats.congestion)}%
-                </span>
-              </div>
-              
-              <div className="channel">
-                <div className="loss-zone-indicator">
-                  <span className="zone-label">Loss Zone</span>
+        {activeTab === 'simulation' ? (
+          <div className="tab-content simulation-tab">
+            {/* Classic Full-Width Visualization at the TOP */}
+            <section className="network-visualization glass-panel neon-border">
+              <div className="network-diagram">
+                <div className="node source-node">
+                  <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
+                  <div className="node-label">Source Node</div>
+                  <div className="node-stats">CWND: {Math.floor(cwnd)}</div>
                 </div>
-                <div className="packets-flow">
-                  {packets.map((packet) => (
-                    <div
-                      key={packet.id}
-                      className={`packet-capsule ${packet.status === 'lost' ? 'lost' : 'active'} type-${packet.type}`}
-                      style={{ 
-                        left: `${packet.progress}%`,
-                        top: `${packet.lane}%`,
-                        transform: 'translate(-50%, -50%)'
+
+                <div className="channel-container">
+                  <div className="channel-info">
+                    <span className="label">Network Medium</span>
+                  </div>
+                  
+                  <div className="channel">
+                    <div className="loss-zone-indicator radar-scanner">
+                      <div className="radar-beam"></div>
+                      <span className="zone-label">Interference Zone</span>
+                    </div>
+                    
+                    <div className="packets-flow">
+                      {packets.map((packet) => (
+                        <div
+                          key={packet.id}
+                          className={`packet-capsule ${packet.status === 'lost' ? 'lost' : 'active'} type-${packet.type}`}
+                          style={{ left: `${packet.progress}%`, top: `${packet.lane}%`, transform: 'translate(-50%, -50%)' }}
+                        >
+                          {packet.status === 'lost' ? <LostIcon /> : <PacketIcon />}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="traffic-legend">
+                    <div className="legend-item"><span className="dot voice"></span> Voice</div>
+                    <div className="legend-item"><span className="dot video"></span> Video</div>
+                    <div className="legend-item"><span className="dot data"></span> Bulk Data</div>
+                  </div>
+                </div>
+
+                <div className="node destination-node">
+                  <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
+                  <div className="node-label">Destination Node</div>
+                  <div className="node-stats text-green">ACK: {stats.delivered}</div>
+                </div>
+              </div>
+            </section>
+
+            <div className="dashboard-grid">
+              <div className="metrics-panel glass-panel">
+                <div className="metrics-header">
+                  <h3>Live Network Health</h3>
+                  <div className={`global-status-banner ${stats.congestion > 70 ? 'danger' : stats.congestion > 40 ? 'warning' : 'secure'}`}>
+                    <span className="status-dot"></span>
+                    {stats.congestion > 70 ? 'SYSTEM OVERLOADED' : stats.congestion > 40 ? 'LINK CONGESTED' : 'OPERATIONAL: SECURE'}
+                  </div>
+                </div>
+                <div className="health-telemetry-grid">
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">Throughput</span>
+                      <span className="telemetry-value text-blue">{stats.throughput} pkts/s</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">Net Latency</span>
+                      <span className="telemetry-value text-warning">{stats.delay}ms</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">Delivered</span>
+                      <span className="telemetry-value text-green">{stats.delivered} pkts</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">Lost Total</span>
+                      <span className="telemetry-value text-red">{lostTotal} pkts</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">In Transit</span>
+                      <span className="telemetry-value text-blue">{packets.length} pkts</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">ssthresh</span>
+                      <span className="telemetry-value text-warning">{ssthresh}</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card wide">
+                    <div className="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></div>
+                    <div className="card-info">
+                      <span className="telemetry-label">Status</span>
+                      <span className="telemetry-value text-blue">{congestionState}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="topology-panel glass-inset">
+                  <div className="panel-header-mini">Logical Link Topology</div>
+                  <div className="topology-container">
+                    <svg viewBox="0 0 400 120" className="topology-svg">
+                      <defs>
+                        <filter id="glow">
+                          <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+                          <feMerge>
+                            <feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/>
+                          </feMerge>
+                        </filter>
+                      </defs>
+                      
+                      {/* Connections */}
+                      <path d="M 60 60 L 160 60" className="topo-link" stroke={stats.throughput > 40 ? 'var(--color-success)' : 'var(--color-warning)'} />
+                      <path d="M 240 60 L 340 60" className="topo-link" stroke={stats.throughput > 40 ? 'var(--color-success)' : 'var(--color-warning)'} strokeDasharray="5,3" />
+
+                      {/* Nodes */}
+                      <g className="topo-node-group">
+                        <circle cx="60" cy="60" r="15" className="topo-circle host" filter="url(#glow)" />
+                        <text x="60" y="95" className="topo-text">HOST</text>
+                      </g>
+
+                      <g className="topo-node-group">
+                        <rect x="160" y="40" width="80" height="40" rx="8" className="topo-rect backbone" filter="url(#glow)" />
+                        <text x="200" y="65" className="topo-text-inner">BACKBONE</text>
+                      </g>
+
+                      <g className="topo-node-group">
+                        <circle cx="340" cy="60" r="15" className="topo-circle edge" filter="url(#glow)" />
+                        <text x="340" y="95" className="topo-text">EDGE</text>
+                      </g>
+                    </svg>
+                  </div>
+                </div>
+
+              </div>
+
+              <div className="controls-panel glass-panel">
+                <div className="control-groups">
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Network Congestion</label>
+                      <span className="value">{stats.congestion}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={stats.congestion}
+                      onChange={(e) => setStats((prev) => ({ ...prev, congestion: parseInt(e.target.value) }))}
+                      className="glass-slider"
+                    />
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Base Loss Rate</label>
+                      <span className="value">{stats.lossRate}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="50"
+                      value={stats.lossRate}
+                      onChange={(e) =>
+                        setStats((prev) => ({ ...prev, lossRate: parseInt(e.target.value) }))
+                      }
+                      className="glass-slider"
+                    />
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Active Network Environment</label>
+                      <span className="value">{activeProfile || 'Custom'}</span>
+                    </div>
+                    <div className="environment-grid">
+                      {NETWORK_PROFILES.map((profile) => (
+                        <button
+                          key={profile.id}
+                          className={`env-card ${activeProfile === profile.id ? 'active' : ''}`}
+                          onClick={() => {
+                            setActiveProfile(profile.id);
+                            setStats((prev) => ({
+                              ...prev,
+                              lossRate: profile.lossRate,
+                              congestion: profile.congestion,
+                            }));
+                            setSpeed(profile.speed);
+                          }}
+                        >
+                          <span className="env-name">{profile.name}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Traffic Fleet Deployment</label>
+                      <span className="queued">Ready: {queuedPackets}</span>
+                    </div>
+                    <div className="traffic-dispatch-box">
+                      <div className="traffic-selector-grid">
+                        <button className={`traffic-option ${selectedType === 'all' ? 'active' : ''}`} onClick={() => setSelectedType('all')}>
+                          <div className="option-sq mix"></div>
+                          <span>Mixed</span>
+                        </button>
+                        <button className={`traffic-option ${selectedType === 'voice' ? 'active' : ''}`} onClick={() => setSelectedType('voice')}>
+                          <div className="option-sq voice"></div>
+                          <span>Voice</span>
+                        </button>
+                        <button className={`traffic-option ${selectedType === 'video' ? 'active' : ''}`} onClick={() => setSelectedType('video')}>
+                          <div className="option-sq video"></div>
+                          <span>Video</span>
+                        </button>
+                        <button className={`traffic-option ${selectedType === 'data' ? 'active' : ''}`} onClick={() => setSelectedType('data')}>
+                          <div className="option-sq data"></div>
+                          <span>Bulk</span>
+                        </button>
+                      </div>
+                      <div className="dispatch-controls">
+                        <input
+                          type="number"
+                          min="1"
+                          max="500"
+                          value={packetTarget}
+                          onChange={(e) => setPacketTarget(Math.max(1, Number(e.target.value) || 1))}
+                          className="glass-input dispatch-input"
+                        />
+                        <button className="neon-button primary dispatch-btn" onClick={queuePacketBatch}>
+                          DEPLOY FLEET
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="action-row">
+                    <button className="neon-button outline" onClick={() => {
+                        setPackets([])
+                        // Reset simulation state for Solar Flare recovery
+                        setQueuedPackets(0)
+                        setLostTotal(0)
+                        setCwnd(1)
+                        setStats(prev => ({ ...prev, throughput: 0, lossRate: 10, congestion: 30, delivered: 0 }))
+                      }}>
+                      RESET SIM
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="tab-content chaos-tab">
+            <div className="chaos-grid">
+              <div className="chaos-controls glass-panel">
+                <h2 className="neon-text">Chaos Lab</h2>
+                <p className="text-muted">Test system resilience under extreme environmental stress.</p>
+                <div className="chaos-toggle-box">
+                  <label className="chaos-switch">
+                    <input 
+                      type="checkbox" 
+                      checked={isChaosEnabled}
+                      onChange={(e) => {
+                        setIsChaosEnabled(e.target.checked)
+                        if (!e.target.checked) setActiveEvent(null)
                       }}
-                    >
-                      {packet.status === 'lost' ? <LostIcon /> : <PacketIcon />}
+                    />
+                    <span className="slider round"></span>
+                  </label>
+                  <span>Autonomous Chaos Mode</span>
+                </div>
+                <div className="manual-triggers">
+                  <h3>Manual Stress Triggers</h3>
+                  <div className="trigger-buttons">
+                    <button className="chaos-trigger ddos" onClick={() => triggerChaos('ddos')}>💀 DDoS Attack</button>
+                    <button className="chaos-trigger solar" onClick={() => triggerChaos('solar-flare')}>☀️ Solar Flare</button>
+                    <button className="chaos-trigger cut" onClick={() => triggerChaos('fiber-cut')}>✂️ Fiber Cut</button>
+                  </div>
+                </div>
+              </div>
+              <div className="chaos-log glass-panel">
+                <h3>Event History Log</h3>
+                <div className="log-entries">
+                  {eventLog.length === 0 && <p className="text-muted">No events recorded.</p>}
+                  {eventLog.map((log, i) => (
+                    <div key={i} className="log-entry">
+                      <span className="log-time">[{log.time}]</span> {log.msg}
                     </div>
                   ))}
                 </div>
               </div>
-
-              <div className="traffic-legend">
-                <div className="legend-item"><span className="dot voice"></span> Voice (High Prio)</div>
-                <div className="legend-item"><span className="dot video"></span> Video (Med Prio)</div>
-                <div className="legend-item"><span className="dot data"></span> Bulk Data (Low Prio)</div>
-              </div>
             </div>
-
-            <div className="node destination-node">
-              <div className="node-icon-wrapper neon-box"><MonitorIcon /></div>
-              <div className="node-label">Destination Node</div>
-              <div className="node-stats">Received: {deliveredPackets}</div>
-            </div>
-          </div>
-        </section>
-
-        <div className="dashboard-grid">
-          {/* Left: Metrics & Analytics */}
-          <section className="metrics-panel glass-panel">
-            <div className="panel-header">
-              <h2>Real-Time Metrics</h2>
-            </div>
-            
-            {/* Show all strictly tracked metrics here perfectly */}
-            <div className="metrics-grid">
-              <div className="metric-card">
-                <div className="metric-label">Throughput</div>
-                <div className="metric-value text-blue">{stats.throughput} <span className="unit">Mbps</span></div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Latency</div>
-                <div className="metric-value text-blue">{Math.round(stats.delay)} <span className="unit">ms</span></div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Packets Sent</div>
-                <div className="metric-value text-primary">{stats.sent} <span className="unit">pkts</span></div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Delivered</div>
-                <div className="metric-value text-green">{deliveredPackets} <span className="unit">pkts</span></div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">In Transit</div>
-                <div className="metric-value text-warning">{activePackets} <span className="unit">pkts</span></div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Total Lost</div>
-                <div className="metric-value text-red">{lostTotal} <span className="unit">pkts</span></div>
-              </div>
-            </div>
-
-            <div className="analysis-feed glass-inset">
-              <h3>Formula Analysis</h3>
-              <ul>
-                <li><strong>State:</strong> {congestionState}</li>
-                <li><strong>Configured Loss (Input):</strong> {stats.lossRate}%</li>
-                <li><strong>Observed Loss Rate:</strong> {observedLossRate.toFixed(1)}%</li>
-                <li><strong>Lost Markers Currently Visible:</strong> {lostPackets}</li>
-                <li><strong>Formula Sync:</strong> Sent ({stats.sent}) = Delivered ({deliveredPackets}) + Lost ({lostTotal}) + Active ({activePackets})</li>
-              </ul>
-              <div className={`status-message ${stats.congestion > 65 ? 'alert' : observedLossRate > 20 ? 'warn' : 'ok'}`}>
-                {stats.congestion > 65
-                  ? '⚠️ Critical network load. Packet drop rate elevated.'
-                  : observedLossRate > 20
-                    ? '⚠️ Packet loss detected. Consider adjusting load parameters.'
-                    : '✅ Network conditions optimal. Smooth transmission.'}
-              </div>
-            </div>
-
-            <div className="oscilloscope-graph glass-inset">
-              <h3 className="graph-title">TCP CWND & Throughput Telemetry</h3>
-              <div className="svg-graph-container">
-                <svg viewBox="0 0 300 100" preserveAspectRatio="none" className="live-graph">
-                  {/* Grid Lines */}
-                  {[...Array(5)].map((_, i) => (
-                    <line key={i} x1="0" y1={i * 25} x2="300" y2={i * 25} stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
-                  ))}
-                  
-                  {/* Throughput Polyline (Cyan) */}
-                  <polyline
-                    fill="none"
-                    stroke="var(--color-cyan)"
-                    strokeWidth="2"
-                    points={history.map((pt, i) => `${i * 10},${100 - Math.min(100, pt.throughput / 5)}`).join(' ')}
-                    style={{ filter: "drop-shadow(0 0 4px var(--color-cyan-glow))" }}
-                  />
-                  
-                  {/* CWND Polyline (Warning/Yellow) */}
-                  <polyline
-                    fill="none"
-                    stroke="var(--color-warning)"
-                    strokeWidth="2"
-                    points={history.map((pt, i) => `${i * 10},${100 - Math.min(100, pt.cwnd)}`).join(' ')}
-                    style={{ filter: "drop-shadow(0 0 4px var(--color-warning-glow))" }}
-                  />
-                </svg>
-                <div className="graph-legend">
-                  <span className="legend-item"><span className="dot cyan"></span> Throughput</span>
-                  <span className="legend-item"><span className="dot warning"></span> CWND Limit</span>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {/* Right: Controls */}
-          <section className="controls-panel glass-panel">
-            <div className="panel-header">
-              <h2>Parameters</h2>
-            </div>
-            
-            <div className="control-groups">
-              <div className="control-item">
-                <div className="control-header">
-                  <label>Traffic Generator</label>
-                  <span className="queued">Queued: {queuedPackets}</span>
-                </div>
-                <div className="input-row">
-                  <select 
-                    value={selectedType} 
-                    onChange={(e) => setSelectedType(e.target.value as any)}
-                    className="glass-input type-select"
-                  >
-                    <option value="all">Mix Traffic</option>
-                    <option value="voice">💓 Voice Only</option>
-                    <option value="video">🎬 Video Only</option>
-                    <option value="data">📦 Bulk Data Only</option>
-                  </select>
-                  <input
-                    type="number"
-                    min="1"
-                    max="500"
-                    value={packetTarget}
-                    onChange={(e) => setPacketTarget(Math.max(1, Number(e.target.value) || 1))}
-                    className="glass-input num-input"
-                  />
-                  <button className="neon-button primary" onClick={queuePacketBatch}>
-                    Deploy
-                  </button>
-                </div>
-              </div>
-
-              <div className="control-item">
-                <div className="control-header">
-                  <label>Network Congestion</label>
-                  <span className="value">{Math.round(stats.congestion)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  value={stats.congestion}
-                  onChange={(e) => setStats((prev) => ({ ...prev, congestion: parseInt(e.target.value) }))}
-                  className="glass-slider"
-                />
-              </div>
-
-              <div className="control-item">
-                <div className="control-header">
-                  <label>Base Loss Rate</label>
-                  <span className="value">{stats.lossRate}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="50"
-                  value={stats.lossRate}
-                  onChange={(e) => setStats((prev) => ({ ...prev, lossRate: parseInt(e.target.value) }))}
-                  className="glass-slider"
-                />
-              </div>
-
+            <div className="chaos-footer glass-panel">
               <div className="control-item">
                 <div className="control-header">
                   <label>Simulation Speed</label>
@@ -501,7 +641,6 @@ function App() {
                   className="glass-slider"
                 />
               </div>
-
               <div className="action-row">
                 <button 
                   className={`neon-button ${isRunning ? 'danger' : 'success'}`}
@@ -509,23 +648,10 @@ function App() {
                 >
                   {isRunning ? 'PAUSE SYSTEM' : 'RESUME SYSTEM'}
                 </button>
-                <button 
-                  className="neon-button outline"
-                  onClick={() => {
-                    setPackets([])
-                    setQueuedPackets(0)
-                    setLostTotal(0)
-                    setCwnd(1)
-                    setHistory([])
-                    setStats({ throughput: 0, delay: 5, lossRate: Math.max(0, Math.min(50, stats.lossRate)), congestion: Math.max(0, Math.min(100, stats.congestion)), sent: 0 })
-                  }}
-                >
-                  RESET
-                </button>
               </div>
             </div>
-          </section>
-        </div>
+          </div>
+        )}
       </main>
     </div>
   )
