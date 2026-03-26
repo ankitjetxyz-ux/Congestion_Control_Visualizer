@@ -22,6 +22,132 @@ interface NetworkProfile {
   description: string
 }
 
+interface TrendPoint {
+  throughput: number
+  delay: number
+  loss: number
+}
+
+type CommunicationMethod = 'parity-even' | 'parity-odd' | 'checksum' | 'crc' | 'hamming'
+
+interface TxBit {
+  id: number
+  sent: '0' | '1'
+  received: '0' | '1'
+  progress: number
+  lane: number
+  flipped: boolean
+}
+
+interface CommHistoryPoint {
+  errorRate: number
+  noise: number
+  detection: number
+}
+
+interface PreparedTransmission {
+  original: string
+  payload: string
+  method: CommunicationMethod
+  checksum?: number
+  crcDivisor?: string
+}
+
+interface TransmissionOutcome {
+  detected: boolean
+  corrected: boolean
+  summary: string
+  normalized: string
+}
+
+const CRC_DIVISOR = '1101'
+
+const sanitizeBits = (value: string) => {
+  const sanitized = value.replace(/[^01]/g, '').slice(0, 32)
+  return sanitized.length > 0 ? sanitized : '10110101'
+}
+
+const toNibbles = (bits: string) => {
+  const neededPadding = (4 - (bits.length % 4)) % 4
+  const padded = bits + '0'.repeat(neededPadding)
+  return padded.match(/.{1,4}/g) ?? []
+}
+
+const checksumFromNibbles = (bits: string) => {
+  const total = toNibbles(bits).reduce((sum, chunk) => sum + parseInt(chunk, 2), 0)
+  const reduced = total % 16
+  return (15 - reduced) & 0b1111
+}
+
+const verifyChecksum = (bits: string, checksum: number) => {
+  const total = toNibbles(bits).reduce((sum, chunk) => sum + parseInt(chunk, 2), 0)
+  return ((total + checksum) % 16) === 15
+}
+
+const xorLongDivision = (input: string, divisor: string) => {
+  const buffer = input.split('').map(Number)
+  const poly = divisor.split('').map(Number)
+
+  for (let i = 0; i <= buffer.length - poly.length; i += 1) {
+    if (buffer[i] === 0) continue
+    for (let j = 0; j < poly.length; j += 1) {
+      buffer[i + j] ^= poly[j]
+    }
+  }
+
+  return buffer.slice(-(poly.length - 1)).join('')
+}
+
+const buildCrcPayload = (bits: string, divisor: string) => {
+  const remainder = xorLongDivision(bits + '0'.repeat(divisor.length - 1), divisor)
+  return `${bits}${remainder}`
+}
+
+const parityBit = (bits: string, mode: 'even' | 'odd') => {
+  const ones = bits.split('').filter((bit) => bit === '1').length
+  const isEven = ones % 2 === 0
+  if (mode === 'even') return isEven ? '0' : '1'
+  return isEven ? '1' : '0'
+}
+
+const encodeHammingNibble = (nibble: string) => {
+  const [d1, d2, d3, d4] = nibble.padEnd(4, '0').split('').map(Number)
+  const p1 = d1 ^ d2 ^ d4
+  const p2 = d1 ^ d3 ^ d4
+  const p4 = d2 ^ d3 ^ d4
+  return `${p1}${p2}${d1}${p4}${d2}${d3}${d4}`
+}
+
+const encodeHamming = (bits: string) => toNibbles(bits).map(encodeHammingNibble).join('')
+
+const decodeHamming = (encoded: string, originalLength: number) => {
+  const chunks = encoded.match(/.{1,7}/g) ?? []
+  let detected = false
+  const correctedBits: string[] = []
+
+  chunks.forEach((chunk) => {
+    if (chunk.length < 7) return
+    const arr = chunk.split('').map(Number)
+    const s1 = arr[0] ^ arr[2] ^ arr[4] ^ arr[6]
+    const s2 = arr[1] ^ arr[2] ^ arr[5] ^ arr[6]
+    const s4 = arr[3] ^ arr[4] ^ arr[5] ^ arr[6]
+    const errorPos = s1 + s2 * 2 + s4 * 4
+
+    if (errorPos > 0) {
+      detected = true
+      arr[errorPos - 1] ^= 1
+    }
+
+    correctedBits.push(`${arr[2]}${arr[4]}${arr[5]}${arr[6]}`)
+  })
+
+  return {
+    detected,
+    corrected: detected,
+    data: correctedBits.join('').slice(0, originalLength),
+  }
+}
+
 const NETWORK_PROFILES: NetworkProfile[] = [
   { id: 'fiber', name: 'Fiber Optics', lossRate: 2, congestion: 10, speed: 1.5, description: 'Ultra-low latency, stable throughput.' },
   { id: 'starlink', name: 'Starlink', lossRate: 8, congestion: 40, speed: 1.0, description: 'Satellite relay with higher variance.' },
@@ -55,6 +181,7 @@ const LostIcon = () => (
 )
 
 function App() {
+  const [mode, setMode] = useState<'congestion' | 'communication'>('congestion')
   const [packets, setPackets] = useState<NetworkPacket[]>([])
   const [stats, setStats] = useState({ throughput: 0, delay: 5, lossRate: 10, congestion: 30, sent: 0, delivered: 0 })
   const [isRunning, setIsRunning] = useState(true)
@@ -66,12 +193,24 @@ function App() {
   const [ssthresh, setSsthresh] = useState(64)
   const [activeProfile, setActiveProfile] = useState<string | null>(null)
   const [selectedType, setSelectedType] = useState<'all' | 'voice' | 'video' | 'data'>('all')
+  const [history, setHistory] = useState<TrendPoint[]>([{ throughput: 0, delay: 5, loss: 10 }])
   
   // Chaos Engine State
   const [activeTab, setActiveTab] = useState<'simulation' | 'chaos' | 'history'>('simulation')
   const [isChaosEnabled, setIsChaosEnabled] = useState(false)
   const [activeEvent, setActiveEvent] = useState<{ type: string, label: string, color: string } | null>(null)
   const [eventLog, setEventLog] = useState<{ time: string, msg: string }[]>([])
+
+  const [bitInput, setBitInput] = useState('10110101')
+  const [commMethod, setCommMethod] = useState<CommunicationMethod>('parity-even')
+  const [noiseLevel, setNoiseLevel] = useState(12)
+  const [txBits, setTxBits] = useState<TxBit[]>([])
+  const [isTxRunning, setIsTxRunning] = useState(false)
+  const [preparedTx, setPreparedTx] = useState<PreparedTransmission | null>(null)
+  const [txSentView, setTxSentView] = useState('')
+  const [txReceivedView, setTxReceivedView] = useState('')
+  const [commOutcome, setCommOutcome] = useState<TransmissionOutcome | null>(null)
+  const [commHistory, setCommHistory] = useState<CommHistoryPoint[]>([{ errorRate: 0, noise: 12, detection: 0 }])
 
   // Use refs for the simulation loop to prevent erratic interval resets
   const statsRef = useRef(stats)
@@ -239,9 +378,53 @@ function App() {
 
   const congestionState =
     stats.congestion < 30 ? 'Low congestion' : stats.congestion < 65 ? 'Moderate congestion' : 'High congestion'
+  const dropRatePercent = stats.sent > 0 ? ((lostTotal / stats.sent) * 100).toFixed(1) : '0.0'
 
   const activeEventRef = useRef(activeEvent)
   useEffect(() => { activeEventRef.current = activeEvent }, [activeEvent])
+
+  // Collect recent history for small line charts
+  useEffect(() => {
+    if (!isRunning) return
+    const id = setInterval(() => {
+      setHistory((prev) => {
+        const next = [...prev, { throughput: statsRef.current.throughput, delay: statsRef.current.delay, loss: statsRef.current.lossRate }]
+        return next.slice(-120)
+      })
+    }, 450)
+    return () => clearInterval(id)
+  }, [isRunning])
+
+  const chartWidth = 360
+  const chartHeight = 140
+  const chartPadding = 8
+  const historySlice = history.slice(-120)
+
+  const buildPath = (key: keyof TrendPoint) => {
+    if (historySlice.length === 0) return ''
+    const values = historySlice.map((p) => p[key])
+    const max = Math.max(...values)
+    const min = Math.min(...values)
+    const span = Math.max(1, max - min)
+    const len = Math.max(1, historySlice.length - 1)
+
+    if (historySlice.length === 1) {
+      const normalized = (historySlice[0][key] - min) / span
+      const plotHeight = chartHeight - chartPadding * 2
+      const y = chartPadding + (1 - normalized) * plotHeight
+      return `M 0 ${y.toFixed(2)} L ${chartWidth} ${y.toFixed(2)}`
+    }
+
+    return historySlice
+      .map((point, idx) => {
+        const x = (idx / len) * chartWidth
+        const normalized = (point[key] - min) / span
+        const plotHeight = chartHeight - chartPadding * 2
+        const y = chartPadding + (1 - normalized) * plotHeight
+        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
+      })
+      .join(' ')
+  }
 
   const triggerChaos = (type: string) => {
     const events: Record<string, any> = {
@@ -252,9 +435,13 @@ function App() {
     const event = events[type]
     setActiveEvent(event)
     setEventLog(prev => [{ time: new Date().toLocaleTimeString(), msg: `EMERGENCY: ${event.label}` }, ...prev].slice(0, 10))
-    
-    // Auto-clear after 6 seconds
-    setTimeout(() => setActiveEvent(null), 6000)
+  }
+
+  const stopActiveChaos = () => {
+    if (!activeEventRef.current) return
+    const stoppedLabel = activeEventRef.current.label
+    setActiveEvent(null)
+    setEventLog(prev => [{ time: new Date().toLocaleTimeString(), msg: `RESOLVED: ${stoppedLabel}` }, ...prev].slice(0, 10))
   }
 
   // Chaos Engine Loop
@@ -274,6 +461,199 @@ function App() {
     setQueuedPackets((prev) => prev + packetTarget)
   }
 
+  const evaluateTransmission = (meta: PreparedTransmission, receivedPayload: string): TransmissionOutcome => {
+    if (meta.method === 'parity-even' || meta.method === 'parity-odd') {
+      const payload = receivedPayload.slice(0, -1)
+      const parity = receivedPayload.slice(-1) || '0'
+      const expected = parityBit(payload, meta.method === 'parity-even' ? 'even' : 'odd')
+      const detected = parity !== expected
+      return {
+        detected,
+        corrected: false,
+        summary: detected ? 'Parity mismatch detected.' : 'Parity check passed.',
+        normalized: payload,
+      }
+    }
+
+    if (meta.method === 'checksum') {
+      const checksum = meta.checksum ?? 0
+      const ok = verifyChecksum(receivedPayload, checksum)
+      return {
+        detected: !ok,
+        corrected: false,
+        summary: ok ? 'Checksum verified at receiver.' : 'Checksum mismatch detected.',
+        normalized: receivedPayload.slice(0, meta.original.length),
+      }
+    }
+
+    if (meta.method === 'crc') {
+      const divisor = meta.crcDivisor ?? CRC_DIVISOR
+      const remainder = xorLongDivision(receivedPayload, divisor)
+      const detected = /1/.test(remainder)
+      return {
+        detected,
+        corrected: false,
+        summary: detected ? `CRC remainder ${remainder} indicates corruption.` : 'CRC remainder is zero; frame accepted.',
+        normalized: receivedPayload.slice(0, meta.original.length),
+      }
+    }
+
+    const decoded = decodeHamming(receivedPayload, meta.original.length)
+    return {
+      detected: decoded.detected,
+      corrected: decoded.corrected,
+      summary: decoded.detected ? 'Hamming syndrome corrected one-bit error.' : 'No syndrome error found.',
+      normalized: decoded.data,
+    }
+  }
+
+  const prepareTransmission = (): PreparedTransmission => {
+    const original = sanitizeBits(bitInput)
+
+    if (commMethod === 'parity-even') {
+      return {
+        original,
+        payload: `${original}${parityBit(original, 'even')}`,
+        method: commMethod,
+      }
+    }
+
+    if (commMethod === 'parity-odd') {
+      return {
+        original,
+        payload: `${original}${parityBit(original, 'odd')}`,
+        method: commMethod,
+      }
+    }
+
+    if (commMethod === 'checksum') {
+      return {
+        original,
+        payload: original,
+        method: commMethod,
+        checksum: checksumFromNibbles(original),
+      }
+    }
+
+    if (commMethod === 'crc') {
+      return {
+        original,
+        payload: buildCrcPayload(original, CRC_DIVISOR),
+        method: commMethod,
+        crcDivisor: CRC_DIVISOR,
+      }
+    }
+
+    return {
+      original,
+      payload: encodeHamming(original),
+      method: commMethod,
+    }
+  }
+
+  const startBitTransmission = () => {
+    const prepared = prepareTransmission()
+    const frame = prepared.payload.split('').map((bit, index) => ({
+      id: Date.now() + index,
+      sent: bit as '0' | '1',
+      received: bit as '0' | '1',
+      progress: 0,
+      lane: 18 + (index % 8) * 9,
+      flipped: false,
+    }))
+
+    setPreparedTx(prepared)
+    setTxSentView(prepared.payload)
+    setTxReceivedView('')
+    setCommOutcome(null)
+    setTxBits(frame)
+    setIsTxRunning(true)
+  }
+
+  useEffect(() => {
+    if (!isTxRunning) return
+
+    const id = setInterval(() => {
+      setTxBits((prev) => {
+        if (prev.length === 0) {
+          setIsTxRunning(false)
+          return prev
+        }
+
+        const next = prev.map((bit) => {
+          const progress = Math.min(100, bit.progress + 2.4 + Math.random() * 2.8)
+          let received = bit.received
+          let flipped = bit.flipped
+
+          if (!flipped && progress > 42 && Math.random() < (noiseLevel / 100) * 0.15) {
+            received = bit.received === '1' ? '0' : '1'
+            flipped = true
+          }
+
+          return { ...bit, progress, received, flipped }
+        })
+
+        const mismatches = next.filter((bit) => bit.sent !== bit.received).length
+        const errorRate = next.length > 0 ? Number(((mismatches / next.length) * 100).toFixed(1)) : 0
+        setCommHistory((prevHistory) => ([
+          ...prevHistory,
+          { errorRate, noise: noiseLevel, detection: 0 },
+        ].slice(-120)))
+
+        const done = next.every((bit) => bit.progress >= 100)
+        if (done) {
+          const received = next.map((bit) => bit.received).join('')
+          setTxReceivedView(received)
+          if (preparedTx) {
+            const outcome = evaluateTransmission(preparedTx, received)
+            setCommOutcome(outcome)
+            setCommHistory((prevHistory) => ([
+              ...prevHistory,
+              { errorRate, noise: noiseLevel, detection: outcome.detected ? 100 : 0 },
+            ].slice(-120)))
+          }
+          setIsTxRunning(false)
+        }
+
+        return next
+      })
+    }, 90)
+
+    return () => clearInterval(id)
+  }, [isTxRunning, noiseLevel, preparedTx])
+
+  const commChartWidth = 360
+  const commChartHeight = 140
+  const commPadding = 8
+  const commSlice = commHistory.slice(-120)
+  const latestCommPoint = commSlice[commSlice.length - 1] ?? { errorRate: 0, noise: noiseLevel, detection: 0 }
+
+  const buildCommPath = (key: keyof CommHistoryPoint) => {
+    if (commSlice.length === 0) return ''
+    const values = commSlice.map((point) => point[key])
+    const max = Math.max(...values)
+    const min = Math.min(...values)
+    const span = Math.max(1, max - min)
+    const len = Math.max(1, commSlice.length - 1)
+
+    if (commSlice.length === 1) {
+      const normalized = (commSlice[0][key] - min) / span
+      const plotHeight = commChartHeight - commPadding * 2
+      const y = commPadding + (1 - normalized) * plotHeight
+      return `M 0 ${y.toFixed(2)} L ${commChartWidth} ${y.toFixed(2)}`
+    }
+
+    return commSlice
+      .map((point, idx) => {
+        const x = (idx / len) * commChartWidth
+        const normalized = (point[key] - min) / span
+        const plotHeight = commChartHeight - commPadding * 2
+        const y = commPadding + (1 - normalized) * plotHeight
+        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
+      })
+      .join(' ')
+  }
+
 
 
 
@@ -282,41 +662,69 @@ function App() {
       <div className="ambient-glow bg-blur-1"></div>
       <div className="ambient-glow bg-blur-2"></div>
 
-      {activeEvent && (
+      {mode === 'congestion' && activeEvent && (
         <div className="chaos-banner" style={{ backgroundColor: activeEvent.color }}>
-          <span className="warning-icon">⚠️</span> {activeEvent.label.toUpperCase()} IN PROGRESS
+          <div className="chaos-banner-content">
+            <span><span className="warning-icon">⚠️</span> {activeEvent.label.toUpperCase()} IN PROGRESS</span>
+            <button className="chaos-banner-stop" onClick={stopActiveChaos}>
+              STOP
+            </button>
+          </div>
         </div>
       )}
 
       <header className="header glass-panel">
         <div className="header-content">
           <div className="header-main">
-            <h1 className="neon-text">Congestion Control Visualizer</h1>
-            <div className="tabs">
+            <h1 className="neon-text">Data Communication & Error Control Visualizer</h1>
+            <div className="mode-switch" role="tablist" aria-label="Project mode">
               <button
-                className={`tab-btn ${activeTab === 'simulation' ? 'active' : ''}`}
-                onClick={() => setActiveTab('simulation')}
+                className={`mode-btn ${mode === 'congestion' ? 'active' : ''}`}
+                onClick={() => setMode('congestion')}
               >
-                Simulation
+                Congestion Control
               </button>
               <button
-                className={`tab-btn ${activeTab === 'chaos' ? 'active' : ''}`}
-                onClick={() => setActiveTab('chaos')}
+                className={`mode-btn ${mode === 'communication' ? 'active' : ''}`}
+                onClick={() => setMode('communication')}
               >
-                Chaos Lab
-              </button>
-              <button
-                className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
-                onClick={() => setActiveTab('history')}
-              >
-                Event Log
+                Data Communication
               </button>
             </div>
+            {mode === 'congestion' && (
+              <div className="tabs">
+                <button
+                  className={`tab-btn ${activeTab === 'simulation' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('simulation')}
+                >
+                  Simulation
+                </button>
+                <button
+                  className={`tab-btn ${activeTab === 'chaos' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('chaos')}
+                >
+                  Chaos Lab
+                </button>
+                <button
+                  className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('history')}
+                >
+                  Event Log
+                </button>
+              </div>
+            )}
+            {mode === 'congestion' && (
+              <div className="speed-badge" aria-label="Simulation speed">
+                <span className="pill-label">Sim Speed</span>
+                <span className="pill-value">{speed.toFixed(1)}x</span>
+              </div>
+            )}
           </div>
         </div>
       </header>
       <main className="main-container">
-        {activeTab === 'simulation' ? (
+        {mode === 'congestion' ? (
+          activeTab === 'simulation' ? (
           <div className="tab-content simulation-tab">
             {/* Classic Full-Width Visualization at the TOP */}
             <section className="network-visualization glass-panel neon-border">
@@ -324,12 +732,16 @@ function App() {
                 <div className="node source-node">
                   <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
                   <div className="node-label">Source Node</div>
-                  <div className="node-stats">CWND: {Math.floor(cwnd)}</div>
                 </div>
 
                 <div className="channel-container">
                   <div className="channel-info">
                     <span className="label">Network Medium</span>
+                    {activeEvent && (
+                      <span className="attack-badge" style={{ borderColor: activeEvent.color, color: activeEvent.color }}>
+                        🔴 {activeEvent.label}
+                      </span>
+                    )}
                   </div>
                   
                   <div className="channel">
@@ -360,7 +772,6 @@ function App() {
                 <div className="node destination-node">
                   <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
                   <div className="node-label">Destination Node</div>
-                  <div className="node-stats text-green">ACK: {stats.delivered}</div>
                 </div>
               </div>
             </section>
@@ -407,8 +818,8 @@ function App() {
                   </div>
                   <div className="telemetry-card">
                     <div className="card-info">
-                      <span className="telemetry-label">ssthresh</span>
-                      <span className="telemetry-value text-warning">{ssthresh}</span>
+                      <span className="telemetry-label">Drop Rate</span>
+                      <span className="telemetry-value text-warning">{dropRatePercent}%</span>
                     </div>
                   </div>
                   <div className="telemetry-card wide">
@@ -418,39 +829,44 @@ function App() {
                     </div>
                   </div>
                 </div>
-                <div className="topology-panel glass-inset">
-                  <div className="panel-header-mini">Logical Link Topology</div>
-                  <div className="topology-container">
-                    <svg viewBox="0 0 400 120" className="topology-svg">
-                      <defs>
-                        <filter id="glow">
-                          <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
-                          <feMerge>
-                            <feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/>
-                          </feMerge>
-                        </filter>
-                      </defs>
-                      
-                      {/* Connections */}
-                      <path d="M 60 60 L 160 60" className="topo-link" stroke={stats.throughput > 40 ? 'var(--color-success)' : 'var(--color-warning)'} />
-                      <path d="M 240 60 L 340 60" className="topo-link" stroke={stats.throughput > 40 ? 'var(--color-success)' : 'var(--color-warning)'} strokeDasharray="5,3" />
-
-                      {/* Nodes */}
-                      <g className="topo-node-group">
-                        <circle cx="60" cy="60" r="15" className="topo-circle host" filter="url(#glow)" />
-                        <text x="60" y="95" className="topo-text">HOST</text>
-                      </g>
-
-                      <g className="topo-node-group">
-                        <rect x="160" y="40" width="80" height="40" rx="8" className="topo-rect backbone" filter="url(#glow)" />
-                        <text x="200" y="65" className="topo-text-inner">BACKBONE</text>
-                      </g>
-
-                      <g className="topo-node-group">
-                        <circle cx="340" cy="60" r="15" className="topo-circle edge" filter="url(#glow)" />
-                        <text x="340" y="95" className="topo-text">EDGE</text>
-                      </g>
+                <div className="attack-impact-visual glass-inset">
+                  <div className="panel-header-mini">Active Threats & Impact</div>
+                  <div className="impact-bars">
+                    <div className="impact-bar-item">
+                      <div className="threat-label">💀 DDoS</div>
+                      <div className="impact-bar-wrapper">
+                        <div className="impact-bar" style={{ width: activeEvent?.type === 'ddos' ? '95%' : '0%', background: activeEvent?.type === 'ddos' ? activeEvent.color : 'rgba(255,255,255,0.1)' }}></div>
+                      </div>
+                      <span className="impact-value">{activeEvent?.type === 'ddos' ? '95%' : '—'}</span>
+                    </div>
+                    <div className="impact-bar-item">
+                      <div className="threat-label">☀️ Solar Flare</div>
+                      <div className="impact-bar-wrapper">
+                        <div className="impact-bar" style={{ width: activeEvent?.type === 'solar-flare' ? '60%' : '0%', background: activeEvent?.type === 'solar-flare' ? activeEvent.color : 'rgba(255,255,255,0.1)' }}></div>
+                      </div>
+                      <span className="impact-value">{activeEvent?.type === 'solar-flare' ? '5x Jitter' : '—'}</span>
+                    </div>
+                    <div className="impact-bar-item">
+                      <div className="threat-label">✂️ Fiber Cut</div>
+                      <div className="impact-bar-wrapper">
+                        <div className="impact-bar" style={{ width: activeEvent?.type === 'fiber-cut' ? '100%' : '0%', background: activeEvent?.type === 'fiber-cut' ? activeEvent.color : 'rgba(255,255,255,0.1)' }}></div>
+                      </div>
+                      <span className="impact-value">{activeEvent?.type === 'fiber-cut' ? '100%' : '—'}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="trend-card glass-inset">
+                  <div className="panel-header-mini">Network Performance</div>
+                  <div className="trend-chart">
+                    <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label="Network performance throughput over time">
+                      <line x1="0" y1={chartHeight - 1} x2={chartWidth} y2={chartHeight - 1} className="trend-grid" />
+                      <line x1="0" y1={chartHeight * 0.5} x2={chartWidth} y2={chartHeight * 0.5} className="trend-grid" />
+                      <line x1="0" y1="1" x2={chartWidth} y2="1" className="trend-grid" />
+                      <path className="trend-line throughput" d={buildPath('throughput')} />
                     </svg>
+                    <div className="trend-legend-single">
+                      <span className="legend-dot throughput"></span><span>Throughput (packets/sec)</span>
+                    </div>
                   </div>
                 </div>
 
@@ -458,6 +874,22 @@ function App() {
 
               <div className="controls-panel glass-panel">
                 <div className="control-groups">
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Simulation Speed</label>
+                      <span className="value">{speed.toFixed(1)}x</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.5"
+                      max="3"
+                      step="0.25"
+                      value={speed}
+                      onChange={(e) => setSpeed(parseFloat(e.target.value))}
+                      className="glass-slider"
+                    />
+                  </div>
+
                   <div className="control-item">
                     <div className="control-header">
                       <label>Network Congestion</label>
@@ -575,7 +1007,7 @@ function App() {
               </div>
             </div>
           </div>
-        ) : activeTab === 'chaos' ? (
+          ) : activeTab === 'chaos' ? (
           <div className="tab-content chaos-tab">
             <div className="chaos-grid">
               <div className="chaos-controls glass-panel">
@@ -602,25 +1034,67 @@ function App() {
                     <button className="chaos-trigger solar" onClick={() => triggerChaos('solar-flare')}>☀️ Solar Flare</button>
                     <button className="chaos-trigger cut" onClick={() => triggerChaos('fiber-cut')}>✂️ Fiber Cut</button>
                   </div>
+                  {activeEvent && (
+                    <div className="action-row" style={{ marginTop: '1rem' }}>
+                      <button className="neon-button outline" onClick={stopActiveChaos}>
+                        STOP ACTIVE ATTACK
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="attack-comparison glass-panel">
+              <h3 style={{ marginBottom: '1.5rem', fontSize: '1.1rem' }}>Attack Impact Comparison</h3>
+              <div className="comparison-grid">
+                <div className="comparison-card">
+                  <div className="attack-name ddos">💀 DDoS Attack</div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Congestion</span>
+                    <span className="metric-value">95%</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Throughput Impact</span>
+                    <span className="metric-value">-80%</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Latency Spike</span>
+                    <span className="metric-value">+200ms</span>
+                  </div>
+                </div>
+                <div className="comparison-card">
+                  <div className="attack-name solar">☀️ Solar Flare</div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Jitter</span>
+                    <span className="metric-value">5x Multiplier</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Packet Variance</span>
+                    <span className="metric-value">High</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Loss Spike</span>
+                    <span className="metric-value">+30%</span>
+                  </div>
+                </div>
+                <div className="comparison-card">
+                  <div className="attack-name cut">✂️ Fiber Cut</div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Link Status</span>
+                    <span className="metric-value">Blackout</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Loss Rate</span>
+                    <span className="metric-value">100%</span>
+                  </div>
+                  <div className="impact-detail">
+                    <span className="metric-label">Throughput</span>
+                    <span className="metric-value">0 pkts/s</span>
+                  </div>
                 </div>
               </div>
             </div>
             <div className="chaos-footer glass-panel">
-              <div className="control-item">
-                <div className="control-header">
-                  <label>Simulation Speed</label>
-                  <span className="value">{speed}x</span>
-                </div>
-                <input
-                  type="range"
-                  min="0.5"
-                  max="3"
-                  step="0.5"
-                  value={speed}
-                  onChange={(e) => setSpeed(parseFloat(e.target.value))}
-                  className="glass-slider"
-                />
-              </div>
               <div className="action-row">
                 <button 
                   className={`neon-button ${isRunning ? 'danger' : 'success'}`}
@@ -631,7 +1105,7 @@ function App() {
               </div>
             </div>
           </div>
-        ) : (
+          ) : (
           <div className="tab-content history-tab">
             <div className="chaos-log glass-panel full-width">
                 <h3>Event History Log</h3>
@@ -644,6 +1118,239 @@ function App() {
                   ))}
                 </div>
               </div>
+          </div>
+          )
+        ) : (
+          <div className="tab-content communication-tab">
+            <section className="network-visualization glass-panel neon-border">
+              <div className="metrics-header">
+                <h3>Bit Transmission Visualizer</h3>
+                <div className={`global-status-banner ${commOutcome?.detected ? 'warning' : 'secure'}`}>
+                  <span className="status-dot"></span>
+                  {isTxRunning ? 'TRANSMITTING' : commOutcome?.detected ? 'ERROR DETECTED' : 'LINK CLEAN'}
+                </div>
+              </div>
+              <div className="network-diagram comm-network-diagram">
+                <div className="node source-node">
+                  <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
+                  <div className="node-label">Sender</div>
+                </div>
+
+                <div className="channel-container">
+                  <div className="channel-info">
+                    <span className="label">Transmission Medium</span>
+                  </div>
+
+                  <div className="comm-medium">
+                    <div className="channel-lane-label">Transmission Channel</div>
+                    {txBits.map((bit) => (
+                      <div
+                        key={bit.id}
+                        className={`tx-bit ${bit.sent !== bit.received ? 'flipped' : ''}`}
+                        style={{ left: `${bit.progress}%`, top: `${bit.lane}%` }}
+                      >
+                        {bit.received}
+                      </div>
+                    ))}
+                    <div className="loss-zone-indicator">
+                      <span className="zone-label">Noise Injection Area</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="node destination-node">
+                  <div className="node-icon-wrapper neon-box"><ServerIcon /></div>
+                  <div className="node-label">Receiver</div>
+                </div>
+              </div>
+              <div className="binary-comparison">
+                <div><span>Sent:</span> <strong>{txSentView || '-'}</strong></div>
+                <div><span>Received:</span> <strong>{txReceivedView || '-'}</strong></div>
+              </div>
+            </section>
+
+            <section className="dashboard-grid">
+              <div className="metrics-panel glass-panel">
+                <h3 style={{ marginBottom: '1rem' }}>Detection Outcome</h3>
+                <div className={`global-status-banner ${commOutcome?.detected ? 'warning' : 'secure'}`} style={{ marginBottom: '1rem' }}>
+                  <span className="status-dot"></span>
+                  {commOutcome ? (commOutcome.detected ? 'FRAME FLAGGED AT RECEIVER' : 'FRAME ACCEPTED') : 'AWAITING TRANSMISSION'}
+                </div>
+                <div className="health-telemetry-grid detection-grid">
+                  <div className="telemetry-card outcome-detected">
+                    <div className="card-info">
+                      <span className="telemetry-label">Detected</span>
+                      <span className={`telemetry-value ${commOutcome?.detected ? 'text-warning' : 'text-green'}`}>
+                        {commOutcome ? (commOutcome.detected ? 'Yes' : 'No') : '--'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card outcome-corrected">
+                    <div className="card-info">
+                      <span className="telemetry-label">Corrected</span>
+                      <span className={`telemetry-value ${commOutcome?.corrected ? 'text-green' : 'text-blue'}`}>
+                        {commOutcome ? (commOutcome.corrected ? 'Yes' : 'No') : '--'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card wide outcome-notes">
+                    <div className="card-info">
+                      <span className="telemetry-label">Receiver Notes</span>
+                      <span className="telemetry-value text-blue">{commOutcome?.summary ?? 'Run transmission to evaluate frame.'}</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card wide outcome-payload">
+                    <div className="card-info">
+                      <span className="telemetry-label">Recovered Payload</span>
+                      <span className="telemetry-value text-green">{commOutcome?.normalized ?? '-'}</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card outcome-error-rate">
+                    <div className="card-info">
+                      <span className="telemetry-label">Current Error Rate</span>
+                      <span className="telemetry-value text-warning">{latestCommPoint.errorRate.toFixed(1)}%</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card outcome-noise-level">
+                    <div className="card-info">
+                      <span className="telemetry-label">Current Noise</span>
+                      <span className="telemetry-value text-blue">{latestCommPoint.noise.toFixed(1)}%</span>
+                    </div>
+                  </div>
+                  <div className="telemetry-card outcome-detection-success">
+                    <div className="card-info">
+                      <span className="telemetry-label">Detection Success</span>
+                      <span className="telemetry-value text-green">{latestCommPoint.detection.toFixed(0)}%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="controls-panel glass-panel">
+                <div className="control-groups">
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Input Data Bits</label>
+                      <span className="value">Max 32 bits</span>
+                    </div>
+                    <input
+                      value={bitInput}
+                      onChange={(e) => setBitInput(sanitizeBits(e.target.value))}
+                      className="glass-input"
+                    />
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Error Control Method</label>
+                    </div>
+                    <select
+                      className="glass-input"
+                      value={commMethod}
+                      onChange={(e) => setCommMethod(e.target.value as CommunicationMethod)}
+                    >
+                      <option value="parity-even">Even Parity</option>
+                      <option value="parity-odd">Odd Parity</option>
+                      <option value="checksum">Checksum (4-bit chunks)</option>
+                      <option value="crc">CRC (divisor 1101)</option>
+                      <option value="hamming">Hamming (7,4)</option>
+                    </select>
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Noise Level</label>
+                      <span className="value">{noiseLevel}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="50"
+                      value={noiseLevel}
+                      onChange={(e) => setNoiseLevel(parseInt(e.target.value))}
+                      className="glass-slider"
+                    />
+                  </div>
+
+                  <div className="control-item">
+                    <div className="control-header">
+                      <label>Prepared Transmission</label>
+                      <span className="value">{preparedTx?.method ?? '-'}</span>
+                    </div>
+                    <div className="analysis-feed">
+                      <div>Payload bits <span className="value">{preparedTx?.payload ?? '-'}</span></div>
+                      <div>Checksum <span className="value">{preparedTx?.checksum?.toString(2).padStart(4, '0') ?? '-'}</span></div>
+                      <div>CRC divisor <span className="value">{preparedTx?.crcDivisor ?? '-'}</span></div>
+                    </div>
+                  </div>
+
+                  <div className="action-row">
+                    <button className="neon-button primary" onClick={startBitTransmission} disabled={isTxRunning}>
+                      {isTxRunning ? 'TRANSMITTING...' : 'SEND FRAME'}
+                    </button>
+                    <button
+                      className="neon-button outline"
+                      onClick={() => {
+                        setTxBits([])
+                        setTxSentView('')
+                        setTxReceivedView('')
+                        setCommOutcome(null)
+                        setPreparedTx(null)
+                      }}
+                    >
+                      RESET FRAME
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="comm-graphs-grid">
+              <div className="comm-panel glass-panel trend-card">
+                <div className="panel-header-mini">Error Rate vs Time</div>
+                <div className="trend-chart">
+                  <svg viewBox={`0 0 ${commChartWidth} ${commChartHeight}`} role="img" aria-label="Error rate trend over time">
+                    <line x1="0" y1={commChartHeight - 1} x2={commChartWidth} y2={commChartHeight - 1} className="trend-grid" />
+                    <line x1="0" y1={commChartHeight * 0.5} x2={commChartWidth} y2={commChartHeight * 0.5} className="trend-grid" />
+                    <line x1="0" y1="1" x2={commChartWidth} y2="1" className="trend-grid" />
+                    <path className="trend-line throughput" d={buildCommPath('errorRate')} />
+                  </svg>
+                  <div className="trend-legend-single">
+                    <span className="legend-dot throughput"></span><span>Error Rate (%)</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="comm-panel glass-panel trend-card">
+                <div className="panel-header-mini">Noise Level vs Time</div>
+                <div className="trend-chart">
+                  <svg viewBox={`0 0 ${commChartWidth} ${commChartHeight}`} role="img" aria-label="Noise level trend over time">
+                    <line x1="0" y1={commChartHeight - 1} x2={commChartWidth} y2={commChartHeight - 1} className="trend-grid" />
+                    <line x1="0" y1={commChartHeight * 0.5} x2={commChartWidth} y2={commChartHeight * 0.5} className="trend-grid" />
+                    <line x1="0" y1="1" x2={commChartWidth} y2="1" className="trend-grid" />
+                    <path className="trend-line delay" d={buildCommPath('noise')} />
+                  </svg>
+                  <div className="trend-legend-single">
+                    <span className="legend-dot delay"></span><span>Noise Level (%)</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="comm-panel glass-panel trend-card">
+                <div className="panel-header-mini">Detection Success vs Time</div>
+                <div className="trend-chart">
+                  <svg viewBox={`0 0 ${commChartWidth} ${commChartHeight}`} role="img" aria-label="Detection success trend over time">
+                    <line x1="0" y1={commChartHeight - 1} x2={commChartWidth} y2={commChartHeight - 1} className="trend-grid" />
+                    <line x1="0" y1={commChartHeight * 0.5} x2={commChartWidth} y2={commChartHeight * 0.5} className="trend-grid" />
+                    <line x1="0" y1="1" x2={commChartWidth} y2="1" className="trend-grid" />
+                    <path className="trend-line loss" d={buildCommPath('detection')} />
+                  </svg>
+                  <div className="trend-legend-single">
+                    <span className="legend-dot loss"></span><span>Detection Success (%)</span>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
         )}
       </main>
